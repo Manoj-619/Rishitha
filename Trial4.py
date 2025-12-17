@@ -31,8 +31,19 @@ class AgmarknetScraper:
         options = webdriver.ChromeOptions()
         prefs = {"download.default_directory": self.download_dir}
         options.add_experimental_option("prefs", prefs)
-        service = Service(self.chrome_driver_path)
-        self.driver = webdriver.Chrome(service=service, options=options)
+        
+        # Add options for better compatibility
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        
+        # Initialize service - handle case where chromedriver might be in PATH
+        if os.path.exists(self.chrome_driver_path):
+            service = Service(self.chrome_driver_path)
+            self.driver = webdriver.Chrome(service=service, options=options)
+        else:
+            # Try to use chromedriver from PATH
+            self.driver = webdriver.Chrome(options=options)
+        
         self.driver.maximize_window()
         self.wait = WebDriverWait(self.driver, 20)
 
@@ -129,14 +140,22 @@ class AgmarknetScraper:
     def close_browser(self):
         time.sleep(1)
         if self.driver:
-            self.driver.quit()
+            try:
+                self.driver.quit()
+            except Exception:
+                pass  # Ignore errors if browser is already closed
+            finally:
+                self.driver = None
 
 
 # ============================================
 #         PROCESS A SINGLE CROP + DISTRICT
 # ============================================
 def process_crop_for_district(scraper, crop_name, crop_id, district, db_config):
-
+    conn = None
+    cur = None
+    browser_closed = False
+    
     try:
         scraper.initialize_driver()
         scraper.open_website("https://www.agmarknet.gov.in/home")
@@ -153,21 +172,26 @@ def process_crop_for_district(scraper, crop_name, crop_id, district, db_config):
             scraper.wait.until(
                 EC.presence_of_element_located((By.XPATH, "//table"))
             )
-        except:
+        except Exception:
             scraper.close_browser()
+            browser_closed = True
             return False, f"{crop_name} - No data for {district}"
 
         # Download CSV
         scraper.click_download_csv()
         scraper.wait_for_download(15)
         scraper.close_browser()
+        browser_closed = True
 
         latest_file = scraper.get_latest_file()
         if not latest_file:
             return False, f"{crop_name} - CSV not downloaded for {district}"
 
         # Read CSV
-        df = pd.read_csv(latest_file, header=2)
+        try:
+            df = pd.read_csv(latest_file, header=2)
+        except Exception as e:
+            return False, f"{crop_name} - Error reading CSV for {district}: {e}"
 
         # Find latest price column
         price_cols = [c for c in df.columns if c.startswith("Price on")]
@@ -176,7 +200,11 @@ def process_crop_for_district(scraper, crop_name, crop_id, district, db_config):
 
         latest_col = price_cols[0]
         date_str = latest_col.replace("Price on", "").strip()
-        pricedate = datetime.datetime.strptime(date_str, "%d %b, %Y").date()
+        
+        try:
+            pricedate = datetime.datetime.strptime(date_str, "%d %b, %Y").date()
+        except Exception as e:
+            return False, f"{crop_name} - Error parsing date for {district}: {e}"
 
         maxprice = df[latest_col].dropna().max()  # take latest date price
         if pd.isna(maxprice):
@@ -184,7 +212,7 @@ def process_crop_for_district(scraper, crop_name, crop_id, district, db_config):
 
         # MSP column if present
         msp_cols = [c for c in df.columns if "MSP" in c]
-        modelprice = df[msp_cols[0]].max() if msp_cols else None
+        modelprice = float(df[msp_cols[0]].max()) if msp_cols and not df[msp_cols[0]].isna().all() else None
 
         # Insert into DB
         conn = psycopg2.connect(**db_config)
@@ -214,50 +242,106 @@ def process_crop_for_district(scraper, crop_name, crop_id, district, db_config):
 
         conn.commit()
         cur.close()
+        cur = None
         conn.close()
+        conn = None
 
         return True, f"{crop_name} - Inserted for {district}"
 
     except Exception as e:
-        return False, f"ERROR {crop_name} {district}: {e}"
+        return False, f"ERROR {crop_name} {district}: {str(e)}"
 
     finally:
-        scraper.close_browser()
+        # Close database connections if still open
+        if cur:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        
+        # Close browser only if not already closed
+        if not browser_closed:
+            scraper.close_browser()
 
 
 # ============================================
 #               EMAIL SENDER
 # ============================================
 def send_email(subject, body):
-    smtp_server = "smtp.office365.com"
-    smtp_port = 587
-    sender_email = "job.notification@plentifarms.com"
-    sender_password = "Pl3nt1f0rM"
+    try:
+        smtp_server = "smtp.office365.com"
+        smtp_port = 587
+        sender_email = "job.notification@plentifarms.com"
+        sender_password = "Pl3nt1f0rM"
 
-    msg = MIMEMultipart()
-    msg["From"] = sender_email
-    msg["To"] = ", ".join([
-        "Rishitha.Akbote@plentifarms.com"
-    ])
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
+        msg = MIMEMultipart()
+        msg["From"] = sender_email
+        msg["To"] = ", ".join([
+            "Rishitha.Akbote@plentifarms.com"
+        ])
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain"))
 
-    with smtplib.SMTP(smtp_server, smtp_port) as server:
-        server.starttls()
-        server.login(sender_email, sender_password)
-        server.send_message(msg)
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
+            server.starttls()
+            server.login(sender_email, sender_password)
+            server.send_message(msg)
+        return True
+    except Exception as e:
+        print(f"Error sending email: {e}")
+        return False
 
 
 # ============================================
 #                   MAIN
 # ============================================
 if __name__ == "__main__":
-
-
-    download_dir = r"C:\Users\RishithaAkbote\OneDrive - Plentifarms\Documents\Task13_RPA_Crop_price\downloads"
-    chrome_driver_path = r"C:\Users\RishithaAkbote\OneDrive - Plentifarms\Documents\Task13_RPA_Crop_price\chromedriver-win64\chromedriver.exe"
-
+    import platform
+    import sys
+    
+    # Get the script directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # Set download directory based on OS
+    if platform.system() == "Windows":
+        download_dir = os.path.join(script_dir, "downloads")
+        # Try to find chromedriver in common locations
+        chrome_driver_path = os.path.join(script_dir, "chromedriver-win64", "chromedriver.exe")
+        if not os.path.exists(chrome_driver_path):
+            # Try alternative path
+            chrome_driver_path = os.path.join(os.path.expanduser("~"), "Downloads", "chromedriver-win64", "chromedriver.exe")
+    else:  # macOS or Linux
+        download_dir = os.path.join(script_dir, "downloads")
+        # For macOS/Linux, try to find chromedriver
+        chrome_driver_path = os.path.join(script_dir, "chromedriver")
+        if not os.path.exists(chrome_driver_path):
+            # Try common locations
+            possible_paths = [
+                "/usr/local/bin/chromedriver",
+                "/opt/homebrew/bin/chromedriver",
+                os.path.join(os.path.expanduser("~"), "chromedriver"),
+            ]
+            for path in possible_paths:
+                if os.path.exists(path):
+                    chrome_driver_path = path
+                    break
+            else:
+                # If not found, use 'chromedriver' and hope it's in PATH
+                chrome_driver_path = "chromedriver"
+    
+    # Create download directory
     os.makedirs(download_dir, exist_ok=True)
+    
+    # Check if chromedriver exists (skip check if it's in PATH)
+    if chrome_driver_path != "chromedriver" and not os.path.exists(chrome_driver_path):
+        print(f"Warning: ChromeDriver not found at {chrome_driver_path}")
+        print("Trying to use ChromeDriver from system PATH...")
+        chrome_driver_path = "chromedriver"  # Fall back to PATH
 
     db_config = {
         "database": "pfmarketplace",
@@ -308,7 +392,7 @@ if __name__ == "__main__":
                 data_saved = True
 
     # ---------------------------------------
-    # SEND EMAIL SUMMARY (EXACTLY LIKE OLD CODE)
+    # SEND EMAIL SUMMARY
     # ---------------------------------------
     subject = (
         "Crop Price RPA - Data Saved in DB"
@@ -322,13 +406,7 @@ if __name__ == "__main__":
     )
 
     print("Sending email summary...")
-    send_email(subject, body)
-    print("Email sent successfully.")
-
-    #  # Send an email if data was saved successfully
-    if data_saved:
-        # Specify the email subject and body
-        subject = "Data Saved in DB tb_mst_crop_price"
-        body = "Crop Price RPA from Agmarknet:\n\n" + "\n".join(email_logs)
-        # Send the email
-        send_email(subject, body)
+    if send_email(subject, body):
+        print("Email sent successfully.")
+    else:
+        print("Failed to send email.")
